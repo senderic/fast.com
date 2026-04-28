@@ -11,7 +11,7 @@ import socket
 import re
 import time
 import sys
-from threading import Thread
+from threading import Thread, Event
 
 def get_token():
     """
@@ -19,7 +19,7 @@ def get_token():
 
     The process involves:
     1. Fetching the main fast.com HTML.
-    2. Finding the script URL for the application logic.
+    2. Finding the script URL for the application logic (e.g., /app-xxxx.js).
     3. Fetching that script and extracting the 'token' string using regex.
 
     Returns:
@@ -27,21 +27,23 @@ def get_token():
     """
     url = 'https://fast.com/'
     try:
-        with urllib.request.urlopen(url) as response:
+        with urllib.request.urlopen(url, timeout=10) as response:
             html = response.read().decode('utf-8')
 
+        # Look for the app JS script tag
         js_match = re.search(r'<script src="(/app-[^"]+\.js)"', html)
         if not js_match:
             return None
 
         js_url = 'https://fast.com' + js_match.group(1)
-        with urllib.request.urlopen(js_url) as response:
+        with urllib.request.urlopen(js_url, timeout=10) as response:
             js_content = response.read().decode('utf-8')
 
+        # Look for the token within the JS content
         token_match = re.search(r'token:"([^"]+)"', js_content)
         if token_match:
             return token_match.group(1)
-    except:
+    except Exception:
         pass
     return None
 
@@ -58,33 +60,35 @@ def get_api_urls(token, force_ipv4=False, force_ipv6=False):
         list: A list of dictionaries, each containing a 'url' for testing.
 
     Raises:
-        Exception: If IP resolution fails when forcing a specific protocol.
+        Exception: If IP resolution fails when forcing a specific protocol or API fails.
     """
     base_url = 'https://api.fast.com/'
     headers = {}
 
     if force_ipv4:
         try:
+            # Resolve api.fast.com to an IPv4 address
             ipv4 = socket.getaddrinfo('api.fast.com', 80, socket.AF_INET)[0][4][0]
             base_url = f'http://{ipv4}/'
             headers = {'Host': 'api.fast.com'}
-        except:
+        except Exception:
             raise Exception("IPv4 resolution failed")
     elif force_ipv6:
         try:
+            # Resolve api.fast.com to an IPv6 address
             ipv6 = socket.getaddrinfo('api.fast.com', 80, socket.AF_INET6)[0][4][0]
             base_url = f'http://[{ipv6}]/'
             headers = {'Host': 'api.fast.com'}
-        except:
+        except Exception:
             raise Exception("IPv6 resolution failed")
 
     url = f"{base_url}netflix/speedtest?https=true&token={token}&urlCount=5"
     req = urllib.request.Request(url, headers=headers)
 
-    with urllib.request.urlopen(req, timeout=5) as response:
+    with urllib.request.urlopen(req, timeout=10) as response:
         return json.loads(response.read().decode('utf-8'))
 
-def download_worker(url, result, index):
+def download_worker(url, result, index, stop_event):
     """
     Worker thread function for measuring download speed.
 
@@ -93,23 +97,22 @@ def download_worker(url, result, index):
 
     Args:
         url (str): The test server URL.
-        result (list): Shared list to store progress.
+        result (list): Shared list to store progress (total bytes).
         index (int): This worker's index in the result list.
+        stop_event (Event): Thread-safe event to signal when to stop.
     """
     try:
-        req = urllib.request.urlopen(url)
-        CHUNK = 100 * 1024
-        i = 1
-        while True:
-            chunk = req.read(CHUNK)
-            if not chunk:
-                break
-            result[index] = i * CHUNK
-            i += 1
-    except:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            CHUNK = 64 * 1024
+            while not stop_event.is_set():
+                chunk = response.read(CHUNK)
+                if not chunk:
+                    break
+                result[index] += len(chunk)
+    except Exception:
         pass
 
-def upload_worker(url, result, index):
+def upload_worker(url, result, index, stop_event):
     """
     Worker thread function for measuring upload speed.
 
@@ -118,22 +121,24 @@ def upload_worker(url, result, index):
 
     Args:
         url (str): The test server URL.
-        result (list): Shared list to store progress.
+        result (list): Shared list to store progress (total bytes).
         index (int): This worker's index in the result list.
+        stop_event (Event): Thread-safe event to signal when to stop.
     """
     try:
-        CHUNK = 100 * 1024
+        CHUNK = 64 * 1024
         data = b'0' * CHUNK
-        i = 1
-        while True:
+        while not stop_event.is_set():
             req = urllib.request.Request(url, data=data, method='POST')
-            with urllib.request.urlopen(req) as response:
-                if response.status == 200:
-                    result[index] = i * CHUNK
-                    i += 1
-                else:
-                    break
-    except:
+            try:
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    if response.status == 200:
+                        result[index] += len(data)
+                    else:
+                        break
+            except Exception:
+                break
+    except Exception:
         pass
 
 def application_bytes_to_networkbits(bytes_val):
@@ -152,10 +157,10 @@ def application_bytes_to_networkbits(bytes_val):
 
 def run_speed_test(urls, mode='download', maxtime=15, verbose=True):
     """
-    Orchestrates a speed test (either download or upload).
+    Orchestrates a speed test phase (either download or upload).
 
-    Spawns multiple worker threads and monitors their progress over a
-    set period of time to calculate the highest achieved speed.
+    Spawns multiple worker threads and monitors their cumulative progress
+    over a set period of time to calculate the highest achieved speed.
 
     Args:
         urls (list): List of test server URLs.
@@ -169,13 +174,14 @@ def run_speed_test(urls, mode='download', maxtime=15, verbose=True):
     amount = len(urls)
     threads = [None] * amount
     results = [0] * amount
+    stop_event = Event()
 
     worker_func = download_worker if mode == 'download' else upload_worker
 
     print(f"Testing {mode} speed", end="", flush=True)
 
     for i in range(amount):
-        threads[i] = Thread(target=worker_func, args=(urls[i], results, i))
+        threads[i] = Thread(target=worker_func, args=(urls[i], results, i, stop_event))
         threads[i].daemon = True
         threads[i].start()
 
@@ -201,6 +207,11 @@ def run_speed_test(urls, mode='download', maxtime=15, verbose=True):
             highestspeedkBps = speedkBps
         time.sleep(sleepseconds)
 
+    # Signal threads to stop and wait briefly
+    stop_event.set()
+    for t in threads:
+        t.join(timeout=0.5)
+
     print()
     Mbps = (application_bytes_to_networkbits(highestspeedkBps) / 1024)
     return float(f"{Mbps:.1f}")
@@ -210,7 +221,7 @@ def fast_com(verbose=True, maxtime=15):
     Executes the full Fast.com speed test suite.
 
     Handles token retrieval, API URL discovery with protocol fallback,
-    and runs both download and upload tests.
+    and runs sequential download and upload tests.
 
     Args:
         verbose (bool): Whether to print detailed logs.
@@ -221,32 +232,34 @@ def fast_com(verbose=True, maxtime=15):
     """
     token = get_token()
     if not token:
-        print("Could not find token")
+        print("Error: Could not find Fast.com token")
         return 0, 0
     if verbose: print(f"Token found: {token}")
 
     parsedjson = None
+    # Attempt to get API URLs with fallbacks
     try:
         if verbose: print("Fetching API URLs via IPv4...")
         parsedjson = get_api_urls(token, force_ipv4=True)
-    except:
+    except Exception:
         try:
             if verbose: print("IPv4 failed, trying IPv6...")
             parsedjson = get_api_urls(token, force_ipv6=True)
-        except:
+        except Exception:
             try:
                 if verbose: print("IPv6 failed, trying default...")
                 parsedjson = get_api_urls(token)
-            except:
-                print("Could not get API URLs")
+            except Exception:
+                print("Error: Could not retrieve speed test URLs from API")
                 return 0, 0
 
     if not parsedjson:
         return 0, 0
 
     urls = [jsonelement['url'] for jsonelement in parsedjson]
-    if verbose: print(f"Number of URLs: {len(urls)}")
+    if verbose: print(f"Number of test URLs: {len(urls)}")
 
+    # Run tests sequentially to avoid interference
     download_speed = run_speed_test(urls, mode='download', maxtime=maxtime, verbose=verbose)
     upload_speed = run_speed_test(urls, mode='upload', maxtime=maxtime, verbose=verbose)
 
@@ -254,13 +267,14 @@ def fast_com(verbose=True, maxtime=15):
 
 if __name__ == "__main__":
     try:
-        print("Starting Speed test against fast.com")
+        print("Starting Speed test against Fast.com")
         download, upload = fast_com(verbose=True)
 
         print(f"\nDownload: {download} Mbit/s")
         print(f"Upload: {upload} Mbit/s")
     except KeyboardInterrupt:
+        print("\nTest cancelled by user")
         sys.exit(0)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"\nUnexpected error: {e}")
         sys.exit(1)
