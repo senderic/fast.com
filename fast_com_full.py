@@ -71,23 +71,27 @@ def application_bytes_to_networkbits(bytes_val):
     # convert bytes (at application layer) to bits (at network layer)
     return bytes_val * 8 * 1.0415
 
-def fast_com(verbose=False, maxtime=15):
+def fast_com(verbose=True, maxtime=15):
     token = get_token()
     if not token:
         if verbose: print("Could not find token")
         return 0
+    if verbose: print(f"Token found: {token}")
 
     parsedjson = None
     # Try IPv4 first
     try:
+        if verbose: print("Fetching API URLs via IPv4...")
         parsedjson = get_api_urls(token, force_ipv4=True)
     except:
         # Fallback to IPv6
         try:
+            if verbose: print("IPv4 failed, trying IPv6...")
             parsedjson = get_api_urls(token, force_ipv6=True)
         except:
             # Final fallback to default
             try:
+                if verbose: print("IPv6 failed, trying default...")
                 parsedjson = get_api_urls(token)
             except:
                 if verbose: print("Could not get API URLs")
@@ -97,11 +101,13 @@ def fast_com(verbose=False, maxtime=15):
         return 0
 
     amount = len(parsedjson)
+    if verbose: print(f"Number of URLs: {amount}")
     threads = [None] * amount
     results = [0] * amount
     urls = [jsonelement['url'] for jsonelement in parsedjson]
 
     for i in range(amount):
+        if verbose: print(f"Starting thread for {urls[i]}")
         threads[i] = Thread(target=get_html_result, args=(urls[i], results, i))
         threads[i].daemon = True
         threads[i].start()
@@ -127,12 +133,15 @@ def fast_com(verbose=False, maxtime=15):
         time.sleep(sleepseconds)
 
     Mbps = (application_bytes_to_networkbits(highestspeedkBps) / 1024)
-    return float(f"{Mbps:.1f}")
+    result_float = float(f"{Mbps:.1f}")
+    if verbose: print(f"Highest Speed (kB/s): {highestspeedkBps:.1f} aka Mbps {result_float}")
+    return result_float
 
 if __name__ == "__main__":
     try:
-        result = fast_com()
-        print(f"Result: {result} Mbps")
+        # Running with verbose=True by default as requested
+        result = fast_com(verbose=True)
+        print(f"\nResult: {result} Mbps")
     except KeyboardInterrupt:
         sys.exit(0)
     except Exception as e:
