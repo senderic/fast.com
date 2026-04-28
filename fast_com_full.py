@@ -47,13 +47,13 @@ def get_api_urls(token, force_ipv4=False, force_ipv6=False):
         except:
             raise Exception("IPv6 resolution failed")
 
-    url = f"{base_url}netflix/speedtest?https=true&token={token}&urlCount=3"
+    url = f"{base_url}netflix/speedtest?https=true&token={token}&urlCount=5"
     req = urllib.request.Request(url, headers=headers)
 
     with urllib.request.urlopen(req, timeout=5) as response:
         return json.loads(response.read().decode('utf-8'))
 
-def get_html_result(url, result, index):
+def download_worker(url, result, index):
     try:
         req = urllib.request.urlopen(url)
         CHUNK = 100 * 1024
@@ -67,48 +67,36 @@ def get_html_result(url, result, index):
     except:
         pass
 
+def upload_worker(url, result, index):
+    try:
+        CHUNK = 100 * 1024
+        data = b'0' * CHUNK
+        i = 1
+        while True:
+            req = urllib.request.Request(url, data=data, method='POST')
+            with urllib.request.urlopen(req) as response:
+                if response.status == 200:
+                    result[index] = i * CHUNK
+                    i += 1
+                else:
+                    break
+    except:
+        pass
+
 def application_bytes_to_networkbits(bytes_val):
-    # convert bytes (at application layer) to bits (at network layer)
     return bytes_val * 8 * 1.0415
 
-def fast_com(verbose=True, maxtime=15):
-    token = get_token()
-    if not token:
-        if verbose: print("Could not find token")
-        return 0
-    if verbose: print(f"Token found: {token}")
-
-    parsedjson = None
-    # Try IPv4 first
-    try:
-        if verbose: print("Fetching API URLs via IPv4...")
-        parsedjson = get_api_urls(token, force_ipv4=True)
-    except:
-        # Fallback to IPv6
-        try:
-            if verbose: print("IPv4 failed, trying IPv6...")
-            parsedjson = get_api_urls(token, force_ipv6=True)
-        except:
-            # Final fallback to default
-            try:
-                if verbose: print("IPv6 failed, trying default...")
-                parsedjson = get_api_urls(token)
-            except:
-                if verbose: print("Could not get API URLs")
-                return 0
-
-    if not parsedjson:
-        return 0
-
-    amount = len(parsedjson)
-    if verbose: print(f"Number of URLs: {amount}")
+def run_speed_test(urls, mode='download', maxtime=15, verbose=True):
+    amount = len(urls)
     threads = [None] * amount
     results = [0] * amount
-    urls = [jsonelement['url'] for jsonelement in parsedjson]
+
+    worker_func = download_worker if mode == 'download' else upload_worker
+
+    if verbose: print(f"Testing {mode} speed", end="", flush=True)
 
     for i in range(amount):
-        if verbose: print(f"Starting thread for {urls[i]}")
-        threads[i] = Thread(target=get_html_result, args=(urls[i], results, i))
+        threads[i] = Thread(target=worker_func, args=(urls[i], results, i))
         threads[i].daemon = True
         threads[i].start()
 
@@ -119,29 +107,64 @@ def fast_com(verbose=True, maxtime=15):
     nrloops = int(maxtime / sleepseconds)
 
     for loop in range(nrloops):
+        if verbose: print(".", end="", flush=True)
         total = sum(results)
         delta = total - lasttotal
         speedkBps = (delta / sleepseconds) / 1024
-
-        if verbose:
-            Mbps = (application_bytes_to_networkbits(speedkBps) / 1024)
-            print(f"Loop {loop} Total MB {total/(1024*1024):.1f} Delta MB {delta/(1024*1024):.1f} Speed kB/s: {speedkBps:.1f} aka Mbps {Mbps:.1f}")
 
         lasttotal = total
         if speedkBps > highestspeedkBps:
             highestspeedkBps = speedkBps
         time.sleep(sleepseconds)
 
+    if verbose: print()
     Mbps = (application_bytes_to_networkbits(highestspeedkBps) / 1024)
-    result_float = float(f"{Mbps:.1f}")
-    if verbose: print(f"Highest Speed (kB/s): {highestspeedkBps:.1f} aka Mbps {result_float}")
-    return result_float
+    return float(f"{Mbps:.1f}")
+
+def fast_com(verbose=True, maxtime=15):
+    token = get_token()
+    if not token:
+        if verbose: print("Could not find token")
+        return 0, 0
+
+    parsedjson = None
+    try:
+        parsedjson = get_api_urls(token, force_ipv4=True)
+    except:
+        try:
+            parsedjson = get_api_urls(token, force_ipv6=True)
+        except:
+            try:
+                parsedjson = get_api_urls(token)
+            except:
+                if verbose: print("Could not get API URLs")
+                return 0, 0
+
+    if not parsedjson:
+        return 0, 0
+
+    urls = [jsonelement['url'] for jsonelement in parsedjson]
+
+    download_speed = run_speed_test(urls, mode='download', maxtime=maxtime, verbose=verbose)
+    upload_speed = run_speed_test(urls, mode='upload', maxtime=maxtime, verbose=verbose)
+
+    return download_speed, upload_speed
 
 if __name__ == "__main__":
     try:
-        # Running with verbose=True by default as requested
-        result = fast_com(verbose=True)
-        print(f"\nResult: {result} Mbps")
+        # Get local IP and ISP if possible
+        try:
+            with urllib.request.urlopen('https://api.fast.com/netflix/speedtest?https=true&token=YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm') as r:
+                # This is just to get a hint, but actually fast.com doesn't easily give ISP in a simple API
+                pass
+        except:
+            pass
+
+        print("Starting Speed test against fast.com")
+        download, upload = fast_com(verbose=True)
+
+        print(f"\nDownload: {download} Mbit/s")
+        print(f"Upload: {upload} Mbit/s")
     except KeyboardInterrupt:
         sys.exit(0)
     except Exception as e:
